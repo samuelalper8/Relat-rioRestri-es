@@ -1,3 +1,2 @@
 streamlit
-reportlab
-pdfplumber
+PyMuPDF==1.24.11
