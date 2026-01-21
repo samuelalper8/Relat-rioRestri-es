@@ -540,7 +540,7 @@ def gerar_pdf_validade_cnd(lista_cnd, logo_bytes):
     doc.save(out)
     return out.getvalue()
 # ==============================================================================
-# 5. INTERFACE STREAMLIT
+# 5. INTERFACE STREAMLIT (AJUSTADA PARA MULTI-ESTADOS)
 # ==============================================================================
 
 with st.sidebar:
@@ -551,40 +551,51 @@ with st.sidebar:
     logo_bytes = uploaded_logo.read() if uploaded_logo else None
 
     st.markdown("---")
-    uf_selecionada = st.selectbox("Selecione a UF", list(MUNICIPIOS_POR_UF.keys()))
     
-    todos_municipios = MUNICIPIOS_POR_UF[uf_selecionada]
-    
-    col_sel1, col_sel2 = st.columns(2)
-    if col_sel1.button("Todos"):
-        st.session_state[f"mun_{uf_selecionada}"] = todos_municipios
-    if col_sel2.button("Limpar"):
-        st.session_state[f"mun_{uf_selecionada}"] = []
-        
-    municipios_selecionados = st.multiselect(
-        "Municípios", 
-        todos_municipios, 
-        key=f"mun_{uf_selecionada}"
+    # MUDANÇA 1: Permite selecionar quais UFs deseja processar (padrão: todas)
+    ufs_disponiveis = list(MUNICIPIOS_POR_UF.keys())
+    ufs_selecionadas = st.multiselect(
+        "Selecione as UFs", 
+        ufs_disponiveis, 
+        default=ufs_disponiveis # Já vem tudo marcado
     )
+    
+    # Consolida lista de municípios baseada nas UFs marcadas
+    todos_municipios_filtrados = []
+    for uf in ufs_selecionadas:
+        todos_municipios_filtrados.extend(MUNICIPIOS_POR_UF[uf])
+    
+    st.markdown("---")
+    st.write(f"**{len(todos_municipios_filtrados)}** municípios carregados das UFs: {', '.join(ufs_selecionadas)}")
 
-st.title("Hub de Relatório de Restrições 🏢")
-st.markdown("Faça upload dos PDFs da RFB/PGFN. O sistema identificará automaticamente a qual município pertencem, extrairá DEVEDOR/MAED/OMISSÃO e gerará os relatórios consolidados.")
+    # Checkbox para "Selecionar Todos Automaticamente" (útil para processar em lote)
+    processar_todos = st.checkbox("Processar todos os municípios da lista", value=True)
+
+    municipios_selecionados = []
+    if not processar_todos:
+        municipios_selecionados = st.multiselect(
+            "Filtrar Municípios Específicos", 
+            todos_municipios_filtrados
+        )
+    else:
+        municipios_selecionados = todos_municipios_filtrados
+
+st.title("Hub de Relatório de Restrições 🏢 (Multi-Estados)")
+st.markdown("Faça upload dos PDFs. O sistema identificará automaticamente municípios de **GO, TO e MS** simultaneamente.")
 
 uploaded_files = st.file_uploader(
-    "Carregue os PDFs dos Relatórios de Situação Fiscal", 
+    "Carregue os PDFs (misturados ou separados)", 
     type=["pdf"], 
     accept_multiple_files=True
 )
 
-# ... (todo o código anterior permanece igual) ...
-
-if st.button("🚀 Processar Arquivos", type="primary"):
+if st.button("🚀 Processar Tudo", type="primary"):
     if not uploaded_files:
         st.warning("Por favor, faça upload de pelo menos um arquivo PDF.")
         st.stop()
     
     if not municipios_selecionados:
-        st.warning("Selecione pelo menos um município na barra lateral.")
+        st.warning("Nenhum município selecionado para processamento.")
         st.stop()
 
     progress_bar = st.progress(0)
@@ -592,10 +603,9 @@ if st.button("🚀 Processar Arquivos", type="primary"):
     
     dados_processados = {m: [] for m in municipios_selecionados}
     fontes_encontradas = {m: None for m in municipios_selecionados}
-    
-    # --- NOVA LISTA PARA O RELATÓRIO DE CND ---
-    lista_cnd_global = [] 
+    lista_cnd_global = []
 
+    # Mapa de normalização para TODOS os municípios selecionados (de todas as UFs)
     mapa_norm = {m: normalizar(m) for m in municipios_selecionados}
     total_files = len(uploaded_files)
     arquivos_usados = 0
@@ -604,8 +614,7 @@ if st.button("🚀 Processar Arquivos", type="primary"):
     
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         
-        # A. Análise dos Arquivos
-        hoje = date.today() # Data de hoje para cálculo
+        hoje = date.today()
         
         for idx, file in enumerate(uploaded_files):
             status_text.text(f"Analisando: {file.name}...")
@@ -613,21 +622,17 @@ if st.button("🚀 Processar Arquivos", type="primary"):
             
             file_bytes = file.getvalue()
             
-            # --- 1. Extração de CND (Para o relatório de validade) ---
+            # 1. CND
             cnpj_cnd, val_cnd, nome_cnd = _extract_cnd_info_exact_stream(file_bytes)
             if val_cnd:
                 data_obj = _parse_date_br_to_date(val_cnd)
-                dias_restantes = (data_obj - hoje).days if data_obj else None
-                
+                dias = (data_obj - hoje).days if data_obj else None
                 lista_cnd_global.append({
-                    "arquivo": file.name,
-                    "nome": nome_cnd,
-                    "cnpj": cnpj_cnd,
-                    "validade": val_cnd,
-                    "dias": dias_restantes
+                    "arquivo": file.name, "nome": nome_cnd, 
+                    "cnpj": cnpj_cnd, "validade": val_cnd, "dias": dias
                 })
 
-            # --- 2. Identificação do Município (Para os relatórios de restrição) ---
+            # 2. Match de Município (Agora procura na lista unificada de GO/TO/MS)
             nome_arquivo = normalizar(file.name)
             municipio_match = None
             for m_real, m_norm in mapa_norm.items():
@@ -641,49 +646,39 @@ if st.button("🚀 Processar Arquivos", type="primary"):
                 
                 itens = _extract_itens_from_stream(file_bytes, file.name)
                 dados_processados[municipio_match].extend(itens)
-                
                 zip_file.writestr(f"Relatorios_Originais/{file.name}", file_bytes)
         
-        # B. Geração dos Relatórios Individuais
-        status_text.text("Gerando relatórios individuais...")
+        # Gera saídas (igual ao anterior)
+        status_text.text("Gerando relatórios consolidados...")
+        
+        # Individuais
         for mun, itens in dados_processados.items():
             if itens: 
                 pdf_bytes = gerar_pdf_individual(itens, mun, fontes_encontradas[mun], logo_bytes)
                 safe_name = mun.replace(" ", "_")
                 zip_file.writestr(f"Relatorios_Individuais/{safe_name}_Analise.pdf", pdf_bytes)
 
-        # C. Geração dos Relatórios Gerenciais (Consolidados)
-        status_text.text("Gerando relatórios gerenciais...")
-        
+        # Gerenciais
         pdf_maed = gerar_pdf_gerencial_maed(dados_processados, logo_bytes)
         zip_file.writestr("Relatorios_Gerenciais/MAEDS_Consolidado.pdf", pdf_maed)
         
         pdf_devedor = gerar_pdf_gerencial_devedor(dados_processados, logo_bytes)
         zip_file.writestr("Relatorios_Gerenciais/DEVEDORES_Consolidado.pdf", pdf_devedor)
         
-        # D. Validade CND (PDF Colorido) - AQUI ESTAVA O ERRO ANTES
-        status_text.text("Gerando relatório de Validade CND...")
-        
-        # Agora chamamos a função correta que gera PDF, não o TXT
-        if lista_cnd_global:
-            pdf_cnd = gerar_pdf_validade_cnd(lista_cnd_global, logo_bytes)
-            zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.pdf", pdf_cnd)
-        else:
-            # PDF vazio avisando que não achou nada
-            pdf_cnd = gerar_pdf_validade_cnd([], logo_bytes)
-            zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.pdf", pdf_cnd)
+        pdf_cnd = gerar_pdf_validade_cnd(lista_cnd_global, logo_bytes)
+        zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.pdf", pdf_cnd)
 
     progress_bar.progress(100)
-    status_text.text("Concluído!")
+    status_text.text("Processamento concluído!")
     
-    st.success(f"Processamento finalizado! {arquivos_usados} arquivos identificados como municípios cadastrados.")
+    st.success(f"Sucesso! {arquivos_usados} arquivos identificados em {len(ufs_selecionadas)} estados.")
     
     st.download_button(
-        label="📥 Baixar Pacote Completo (.zip)",
+        label="📥 Baixar ZIP Completo (Todos os Estados)",
         data=zip_buffer.getvalue(),
-        file_name=f"Analise_Restricoes_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        file_name=f"Analise_Geral_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
         mime="application/zip",
         type="primary"
     )
 
-st.info("Nota: O sistema utiliza algoritmos de reconhecimento de texto para identificar 'DEVEDOR', 'MAED' e 'OMISSÃO'. Verifique sempre os arquivos originais em caso de dúvida.")
+st.info("Dica: Você pode fazer upload de arquivos de GO, TO e MS misturados. O sistema separará automaticamente.")
