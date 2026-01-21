@@ -1,315 +1,603 @@
 import streamlit as st
-from io import BytesIO
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-from reportlab.lib.colors import HexColor
-from datetime import datetime
+import fitz  # PyMuPDF
 import re
-import xml.etree.ElementTree as ET
-import pdfplumber  # Biblioteca para ler PDF
+import io
+import zipfile
+import unicodedata
+import json
+import urllib.request
+from datetime import datetime, date
+from difflib import SequenceMatcher
 
-# --- 1. CONFIGURAÇÃO INICIAL ---
-st.set_page_config(page_title="Auditoria INSS - ConPrev", layout="centered", page_icon="🛡️")
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="Relatório de Restrições - ConPrev", layout="wide", page_icon="📋")
 
-# --- 2. SISTEMA DE LOGIN (COM SECRETS RECOMENDADO) ---
-def check_password():
-    """Retorna True se o usuário tiver a senha correta."""
-    if "password_correct" not in st.session_state:
-        st.session_state["password_correct"] = False
+# ==============================================================================
+# 1. DADOS E CONSTANTES (MUNICÍPIOS)
+# ==============================================================================
 
-    if st.session_state["password_correct"]:
-        return True
+MUNICIPIOS_POR_UF = {
+    "GO": [
+        "Amaralina", "Baliza", "Barro Alto", "Bela Vista de Goiás", "Brazabrantes", 
+        "Buriti Alegre", "Caiapônia", "Catalão", "Campinaçu", "Ceres", "Córrego do Ouro", 
+        "Corumba de Goiás", "Cristalina", "Crixás", "Goiás", "Goiatuba", "Hidrolina", 
+        "Itaberaí", "Itapaci", "Jaraguá", "Montes Claros de Goiás", "Nerópolis", 
+        "Novo Gama", "Paranaiguara", "Perolândia", "Pilar de Goiás", "Piranhas", 
+        "Rianápolis", "Rio Quente", "Serranópolis", "São Francisco de Goiás", 
+        "São Luís Montes Belos", "Teresina de Goiás", "Trindade", "Uirapuru"
+    ],
+    "TO": [
+        "Aguiarnópolis", "Almas", "Bandeirantes do Tocantins", "Barra do Ouro", 
+        "Brejinho de Nazaré", "Cristalândia", "Goianorte", "Guaraí", "Jaú do Tocantins", 
+        "Lajeado", "Maurilândia do Tocantins", "Natividade", "Palmeiras do Tocantins", 
+        "Palmeirópolis", "Paraíso do Tocantins", "Paranã", "Pedro Afonso", "Peixe", 
+        "Santa Maria do Tocantins", "Santa Rita do Tocantins", "São Valério", "Silvanópolis"
+    ],
+    "MS": [
+        "Alcinópolis", "Anastácio", "Chapadão do Sul", "Coxim", "Iguatemi", 
+        "Japorã", "Jaraguari", "Sete Quedas", "Sonora", "Tacuru"
+    ],
+}
 
-    # Campo de senha
-    senha_input = st.text_input("Senha de Acesso", type="password")
+_STOPWORDS_MUN = {"de", "da", "do", "das", "dos", "municipio", "municipio de", "camara", "prefeitura", "municipal"}
+
+# ==============================================================================
+# 2. FUNÇÕES UTILITÁRIAS (Adaptadas do seu código)
+# ==============================================================================
+
+def normalizar(s: str) -> str:
+    t = unicodedata.normalize("NFKD", str(s))
+    return t.encode("ascii", "ignore").decode().lower().strip()
+
+def _canon_mun(s: str) -> str:
+    if s is None: return ""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    tokens = [t for t in s.split() if t and t not in _STOPWORDS_MUN]
+    return "".join(tokens)
+
+def _tokens_mun(s: str) -> set:
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return {t for t in s.split() if t and t not in _STOPWORDS_MUN}
+
+def corresponde_municipio(base_norm: str, mun_norm: str) -> bool:
+    if mun_norm == "goias":
+        tok_b = _tokens_mun(base_norm)
+        if "goias" not in tok_b: return False
+        extras = {"go"}
+        significativos = {t for t in tok_b if t != "goias" and t not in extras}
+        return not significativos
+
+    cb = _canon_mun(base_norm)
+    cm = _canon_mun(mun_norm)
+    if not cb or not cm: return False
+    if cm in cb: return True
     
-    # Verifica se a senha foi digitada e compara
-    # Nota: Em produção, use st.secrets["password"] ao invés de hardcode
-    if senha_input:
-        if senha_input == "conprev2026": 
-            st.session_state["password_correct"] = True
-            st.rerun()
+    tok_m = _tokens_mun(mun_norm)
+    tok_b = _tokens_mun(base_norm)
+    if tok_m and tok_m.issubset(tok_b): return True
+    
+    ratio = SequenceMatcher(None, cm, cb).ratio()
+    return ratio >= 0.90
+
+def _mask_cnpj_digits(s: str) -> str:
+    d = re.sub(r"\D", "", str(s or ""))[:14]
+    if len(d) != 14: return s or ""
+    return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:14]}"
+
+def _fmt_money(v) -> str:
+    if v is None: return "0,00"
+    s = str(v).strip()
+    if not s: return "0,00"
+    if "," in s and any(ch.isdigit() for ch in s): return s
+    try:
+        num = float(s.replace(".", "").replace(",", "."))
+        s = f"{num:,.2f}"
+        s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+        return s
+    except: return s
+
+# --- CND Lookup & Helpers ---
+_CNPJ_LOOKUP_CACHE = {}
+def _cnpj_lookup_online(cnpj_in: str) -> str:
+    try:
+        d = re.sub(r"\D", "", str(cnpj_in or ""))[:14]
+        if len(d) != 14: return ""
+        if d in _CNPJ_LOOKUP_CACHE: return _CNPJ_LOOKUP_CACHE[d]
+        
+        req = urllib.request.Request(f"https://brasilapi.com.br/api/cnpj/v1/{d}", headers={"User-Agent":"conprev-app"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8","ignore"))
+                nome = (data.get("razao_social") or data.get("nome_fantasia") or "").strip()
+                if nome:
+                    _CNPJ_LOOKUP_CACHE[d] = nome
+                    return nome
+        return ""
+    except: return ""
+
+def _resolve_name_prefer_cnpj(label: str, cnpj_masked: str) -> str:
+    nm = _cnpj_lookup_online(cnpj_masked)
+    return nm or (label or "")
+
+def _parse_date_br_to_date(s: str):
+    if not s: return None
+    m = re.search(r"(\d{2})/(\d{2})/(\d{4})", str(s))
+    if not m: return None
+    try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except: return None
+
+def _cnd_days_color_tuple(days: int):
+    if days is None: return (0, 0, 0)
+    if days > 90: return (0.05, 0.55, 0.15)
+    if days > 30: return (0.95, 0.75, 0.08)
+    if days > 0: return (1.00, 0.45, 0.00)
+    return (0.90, 0.12, 0.12)
+
+# ==============================================================================
+# 3. EXTRAÇÃO DE DADOS (CORE LOGIC)
+# ==============================================================================
+
+def _extract_itens_from_stream(file_bytes, filename):
+    """Lê bytes do PDF e extrai itens de restrição."""
+    itens = []
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        
+        # 1. Mapa de CNPJ do cabeçalho
+        header_map = {}
+        try:
+            full_text = ""
+            for p in doc: full_text += p.get_text()
+            for m in re.finditer(r"CNPJ:\s*([\d\./\-]{14,20}).{0,160}?vinculado.*?\n([^\n]+)", full_text, flags=re.I):
+                cn = re.sub(r"\D", "", m.group(1))[:14]
+                header_map[cn] = " ".join(m.group(2).split())
+        except: pass
+
+        current_cnpj = None
+        current_org = None
+
+        for page in doc:
+            pf_inside = False
+            pf_prev_proc = None
+            pf_prev_loc = None
+            
+            # Extração estruturada (dict)
+            blocks = page.get_text("dict")["blocks"]
+            lines = []
+            for b in blocks:
+                for l in b.get("lines", []):
+                    text = "".join([s["text"] for s in l.get("spans", [])])
+                    text = " ".join(text.split())
+                    if text: lines.append(text)
+            
+            i = 0
+            while i < len(lines):
+                t = lines[i]
+                U = t.upper()
+
+                # A. Cabeçalho CNPJ
+                if "CNPJ" in U:
+                    m = re.search(r"CNPJ[:\s]*([0-9\.\-\/]{14,18})(?:\s*-\s*(.+))?", t, flags=re.I)
+                    if m:
+                        current_cnpj = re.sub(r"\D", "", m.group(1))
+                        name_inline = (m.group(2) or "").strip()
+                        if name_inline and not re.search(r"\d", name_inline):
+                            current_org = name_inline
+                        else:
+                            # Busca nas próximas linhas
+                            for k in range(1, 5):
+                                if i+k >= len(lines): break
+                                nxt = lines[i+k].strip()
+                                if len(nxt) >= 5 and not re.search(r"\d", nxt) and "PÁGINA" not in nxt.upper():
+                                    current_org = nxt
+                                    break
+                    i += 1
+                    continue
+                
+                # B. DEVEDOR
+                if U == "DEVEDOR":
+                    try:
+                        # Tenta pegar as linhas anteriores que compõem o registro
+                        if i >= 8:
+                            cod_nome = lines[i-8]
+                            comp = lines[i-7]; venc = lines[i-6]; orig = lines[i-5]
+                            dev = lines[i-4]; multa = lines[i-3]; juros = lines[i-2]; cons = lines[i-1]
+                            
+                            parts = cod_nome.split(" - ", 1)
+                            cod = parts[0] if len(parts) > 0 else ""
+                            nome = parts[1] if len(parts) > 1 else cod_nome.replace(cod, "").strip()
+
+                            itens.append({
+                                "tipo": "DEVEDOR", "cod": cod, "nome": nome, "comp": comp, 
+                                "venc": venc, "orig": orig, "dev": dev, "multa": multa, 
+                                "juros": juros, "cons": cons,
+                                "orgao": _resolve_name_prefer_cnpj(current_org, _mask_cnpj_digits(current_cnpj)),
+                                "cnpj": _mask_cnpj_digits(current_cnpj), "src": filename
+                            })
+                    except:
+                        itens.append({"tipo": "DEVEDOR", "raw": t, "src": filename})
+                    i += 1
+                    continue
+
+                # C. MAED
+                if "MAED" in U:
+                    try:
+                        pa_comp = lines[i+1]; venc = lines[i+2]; orig = lines[i+3]; dev = lines[i+4]; situ = lines[i+5]
+                        parts = t.split(" - ", 1)
+                        cod = parts[0].strip()
+                        desc = parts[1].strip() if len(parts) > 1 else "MAED"
+                        
+                        comp = pa_comp
+                        if re.match(r"\d{2}/\d{2}/\d{4}$", pa_comp):
+                            comp = f"{pa_comp[3:5]}/{pa_comp[6:10]}"
+                        
+                        itens.append({
+                            "tipo": "MAED", "cod": cod, "desc": desc, "comp": comp, 
+                            "venc": venc, "orig": orig, "dev": dev, "situacao": situ.strip(),
+                            "orgao": _resolve_name_prefer_cnpj(current_org, _mask_cnpj_digits(current_cnpj)),
+                            "cnpj": _mask_cnpj_digits(current_cnpj), "src": filename
+                        })
+                    except:
+                        itens.append({"tipo": "MAED", "raw": t, "src": filename})
+                    i += 1
+                    continue
+
+                # D. OMISSÃO
+                if "OMISS" in U:
+                    periodo = None
+                    for k in range(1, 7):
+                        if i+k >= len(lines): break
+                        look = lines[i+k].upper()
+                        if "PERÍODO" in look: continue
+                        if re.search(r"\d{4}", look) or re.search(r"\d{2}/\d{4}", look):
+                            periodo = lines[i+k]
+                            break
+                    itens.append({
+                        "tipo": "OMISSÃO", "raw": t, "periodo": periodo or "",
+                        "orgao": _resolve_name_prefer_cnpj(current_org, _mask_cnpj_digits(current_cnpj)),
+                        "cnpj": _mask_cnpj_digits(current_cnpj), "src": filename
+                    })
+                    i += 1
+                    continue
+                
+                # E. PROCESSO FISCAL (Lógica simplificada para Web)
+                if "PROCESSO FISCAL" in U and "PEND" in U:
+                    pf_inside = True
+                    i += 1; continue
+                
+                if pf_inside:
+                    if "PENDENCIA -" in U: pf_inside = False
+                    
+                    if "DEVEDOR" in U:
+                        # Tenta achar o processo nas linhas vizinhas
+                        proc = None
+                        for k in range(-5, 5):
+                            if i+k >= 0 and i+k < len(lines):
+                                m_proc = re.search(r"(\d{4,6}\.\d{3}\.\d{3}/\d{4}-\d{2})", lines[i+k])
+                                if m_proc: proc = m_proc.group(1); break
+                        
+                        if proc:
+                            itens.append({
+                                "tipo": "PROCESSO FISCAL", "processo": proc, "situacao": "DEVEDOR",
+                                "orgao": _resolve_name_prefer_cnpj(current_org, _mask_cnpj_digits(current_cnpj)),
+                                "cnpj": _mask_cnpj_digits(current_cnpj), "src": filename
+                            })
+                
+                i += 1
+
+    except Exception as e:
+        st.error(f"Erro ao ler PDF {filename}: {e}")
+    
+    return itens
+
+def _extract_cnd_info_exact_stream(file_bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    texto = ""
+    for i, p in enumerate(doc):
+        if i > 1: break
+        texto += p.get_text()
+    
+    cnpj = ""; validade = ""; nome = ""
+    
+    m_nome = re.search(r"(?im)^\s*CNPJ\s*:\s*[0-9\.\-\/]{8,18}\s*[-–—]\s*([^\n]+)$", texto, re.MULTILINE)
+    if m_nome and "ENTE FEDERATIVO" not in m_nome.group(1).upper():
+        nome = m_nome.group(1).strip()
+    elif not nome:
+        m_mun = re.search(r"(?im)^\s*Munic[ií]pio\s*:\s*([^\n]+)$", texto, re.MULTILINE)
+        if m_mun: nome = m_mun.group(1).strip()
+
+    m_cnpj = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto)
+    if m_cnpj: cnpj = m_cnpj.group(1)
+
+    m_val = re.search(r"(?im)Data\s*de\s*Validade\s*:\s*([0-9]{2}/[0-9]{2}/[0-9]{4})", texto)
+    if m_val: validade = m_val.group(1)
+
+    return cnpj, validade, nome
+
+# ==============================================================================
+# 4. GERAÇÃO DE RELATÓRIOS PDF (REPORTLAB / FITZ WRAPPER)
+# ==============================================================================
+
+def _register_fonts(doc):
+    # No Streamlit Cloud, não temos acesso fácil a fontes do Windows.
+    # Usaremos fontes padrão do PDF (Helvetica)
+    return {"regular": "Helvetica", "bold": "Helvetica-Bold"}
+
+def _draw_header(page, logo_bytes, titulo, info, fonts):
+    W, H = page.rect.width, page.rect.height
+    margin = 36
+    y = margin
+
+    if logo_bytes:
+        try:
+            rect = fitz.Rect(margin, y, margin+130, y+60)
+            page.insert_image(rect, stream=logo_bytes)
+        except: pass
+    
+    text_x = margin + 142
+    page.insert_text((text_x, y+16), titulo, fontname=fonts["bold"], fontsize=16)
+    page.insert_text((text_x, y+36), info, fontname=fonts["regular"], fontsize=10)
+    
+    y_sep = y + 76
+    page.draw_line((margin, y_sep), (W-margin, y_sep), color=(0,0,0), width=0.7)
+    return y_sep + 16, margin
+
+def gerar_pdf_individual(itens, municipio, src_name, logo_bytes):
+    doc = fitz.open()
+    fonts = _register_fonts(doc)
+    A4 = fitz.paper_rect("a4")
+    page = doc.new_page(width=A4.height, height=A4.width) # Paisagem se quiser, ou A4 normal
+    
+    titulo = f"RELATÓRIO DE RESTRIÇÕES · {municipio}"
+    info = f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} · Fonte: RFB/PGFN"
+    
+    y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+    
+    # Renderização simplificada dos itens
+    line_h = 14
+    
+    def check_page(curr_y):
+        if curr_y > A4.width - 40:
+            new_p = doc.new_page(width=A4.height, height=A4.width)
+            return _draw_header(new_p, logo_bytes, titulo, info, fonts)[0], new_p
+        return curr_y, page
+
+    for item in itens:
+        tipo = item.get("tipo", "")
+        texto = f"[{tipo}] "
+        if tipo == "DEVEDOR":
+            texto += f"{item.get('cod')} - {item.get('nome')} | Venc: {item.get('venc')} | R$ {item.get('dev')}"
+        elif tipo == "MAED":
+            texto += f"{item.get('cod')} - {item.get('desc')} | Comp: {item.get('comp')} | R$ {item.get('dev')}"
+        elif tipo == "OMISSÃO":
+            texto += f"Período: {item.get('periodo')}"
         else:
-            st.error("Senha incorreta")
+            texto += str(item.get("raw", ""))[:100]
             
-    return False
+        y, page = check_page(y)
+        page.insert_text((x, y), texto, fontname=fonts["regular"], fontsize=10)
+        y += line_h
 
-if not check_password():
-    st.stop()
+    out_buffer = io.BytesIO()
+    doc.save(out_buffer)
+    doc.close()
+    return out_buffer.getvalue()
 
-# --- 3. FUNÇÕES DE EXTRAÇÃO ---
-
-def extrair_dados_xml(arquivo):
-    """Lê um XML padrão NFS-e e tenta encontrar os dados."""
-    try:
-        tree = ET.parse(arquivo)
-        root = tree.getroot()
-        xml_text = ET.tostring(root, encoding='utf8', method='xml').decode()
+def gerar_pdf_gerencial_maed(dados_municipios, logo_bytes):
+    doc = fitz.open()
+    fonts = _register_fonts(doc)
+    page = doc.new_page(width=842, height=595) # A4 Landscape
+    titulo = "RELATÓRIO GERENCIAL · MAED"
+    info = f"Gerado em {datetime.now().strftime('%d/%m/%Y')}"
+    y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+    
+    line_h = 16
+    
+    has_content = False
+    for mun, itens in dados_municipios.items():
+        maeds = [i for i in itens if i['tipo'] == 'MAED']
+        if not maeds: continue
+        has_content = True
         
-        # Regex para capturar dados
-        cnpj_match = re.search(r'<Cnpj>(.*?)</Cnpj>', xml_text, re.IGNORECASE)
-        valor_match = re.search(r'<ValorServicos>(.*?)</ValorServicos>', xml_text, re.IGNORECASE)
-        inss_match = re.search(r'<ValorInss>(.*?)</ValorInss>', xml_text, re.IGNORECASE)
-        prestador_match = re.search(r'<RazaoSocial>(.*?)</RazaoSocial>', xml_text, re.IGNORECASE)
-        numero_match = re.search(r'<Numero>(.*?)</Numero>', xml_text, re.IGNORECASE)
-
-        dados = {}
-        if cnpj_match: dados['cnpj'] = cnpj_match.group(1)
-        if valor_match: dados['valor'] = float(valor_match.group(1))
-        if inss_match: dados['inss'] = float(inss_match.group(1))
-        if prestador_match: dados['prestador'] = prestador_match.group(1)
-        if numero_match: dados['numero'] = numero_match.group(1)
-        
-        return dados
-    except Exception as e:
-        st.error(f"Erro ao ler XML: {e}")
-        return None
-
-def extrair_dados_pdf(arquivo):
-    """Lê um PDF de texto e tenta encontrar padrões (Regex)."""
-    try:
-        text = ""
-        with pdfplumber.open(arquivo) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-        
-        dados = {}
-        
-        # Padrões comuns de Regex
-        cnpj_match = re.search(r'CNPJ:?\s?(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})', text)
-        if cnpj_match: dados['cnpj'] = cnpj_match.group(1)
-        
-        valor_match = re.search(r'TOTAL DO SERVIÇO:?\s?R?\$?\s?([\d.,]+)', text, re.IGNORECASE)
-        if not valor_match:
-            valor_match = re.search(r'VALOR TOTAL:?\s?R?\$?\s?([\d.,]+)', text, re.IGNORECASE)
-        
-        if valor_match:
-            valor_str = valor_match.group(1).replace('.', '').replace(',', '.')
-            dados['valor'] = float(valor_str)
+        if y > 550: 
+            page = doc.new_page(width=842, height=595)
+            y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
             
-        inss_match = re.search(r'INSS RETIDO:?\s?R?\$?\s?([\d.,]+)', text, re.IGNORECASE)
-        if inss_match:
-            inss_str = inss_match.group(1).replace('.', '').replace(',', '.')
-            dados['inss'] = float(inss_str)
+        page.insert_text((x, y), mun, fontname=fonts["bold"], fontsize=12); y += line_h * 1.5
+        
+        for d in maeds:
+            if y > 550:
+                page = doc.new_page(width=842, height=595)
+                y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+            
+            line = f"• {d.get('cod')} - {d.get('desc')} | Comp: {d.get('comp')} | Venc: {d.get('venc')} | Saldo: R$ {_fmt_money(d.get('dev'))}"
+            page.insert_text((x+10, y), line, fontname=fonts["regular"], fontsize=10)
+            y += line_h
+        y += line_h
 
-        num_match = re.search(r'N[ºo].?\s?(\d+)', text, re.IGNORECASE)
-        if num_match: dados['numero'] = num_match.group(1)
+    if not has_content:
+        page.insert_text((x, y), "Nenhum MAED encontrado nos arquivos selecionados.", fontname=fonts["regular"], fontsize=12)
 
-        return dados
-    except Exception as e:
-        st.error(f"Erro ao ler PDF: {e}")
-        return None
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
 
-# --- 4. GERENCIAMENTO DE ESTADO ---
-if 'form_prestador' not in st.session_state: st.session_state['form_prestador'] = ''
-if 'form_cnpj' not in st.session_state: st.session_state['form_cnpj'] = ''
-if 'form_numero' not in st.session_state: st.session_state['form_numero'] = ''
-if 'form_valor' not in st.session_state: st.session_state['form_valor'] = 0.00
-if 'form_retencao' not in st.session_state: st.session_state['form_retencao'] = 0.00
+def gerar_pdf_gerencial_devedor(dados_municipios, logo_bytes):
+    doc = fitz.open()
+    fonts = _register_fonts(doc)
+    page = doc.new_page(width=842, height=595)
+    titulo = "RELATÓRIO GERENCIAL · DEVEDORES"
+    info = f"Gerado em {datetime.now().strftime('%d/%m/%Y')}"
+    y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+    line_h = 16
+    
+    has_content = False
+    for mun, itens in dados_municipios.items():
+        devs = [i for i in itens if i['tipo'] == 'DEVEDOR']
+        # Filtro MAED disfarçado de DEVEDOR
+        clean_devs = []
+        for d in devs:
+            raw = str(d).upper()
+            if "MAED" not in raw and "DCTFWEB" not in raw and not str(d.get('cod')).startswith("5440"):
+                clean_devs.append(d)
+        
+        if not clean_devs: continue
+        has_content = True
 
-# --- 5. BARRA LATERAL (UPLOAD) ---
+        if y > 550: 
+            page = doc.new_page(width=842, height=595)
+            y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+            
+        page.insert_text((x, y), mun, fontname=fonts["bold"], fontsize=12); y += line_h * 1.5
+        
+        for d in clean_devs:
+            if y > 530: # Item ocupa 2 linhas
+                page = doc.new_page(width=842, height=595)
+                y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+                
+            l1 = f"• {d.get('cod')} - {d.get('nome')} ({d.get('comp')})"
+            l2 = f"  Original: R$ {_fmt_money(d.get('orig'))} | Consolidado: R$ {_fmt_money(d.get('cons'))}"
+            
+            page.insert_text((x+10, y), l1, fontname=fonts["regular"], fontsize=10); y += line_h
+            page.insert_text((x+10, y), l2, fontname=fonts["regular"], fontsize=10, color=(0.4, 0.4, 0.4)); y += line_h
+        y += line_h
+
+    if not has_content: page.insert_text((x, y), "Nenhum DEVEDOR encontrado.", fontname=fonts["regular"], fontsize=12)
+    
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+# ==============================================================================
+# 5. INTERFACE STREAMLIT
+# ==============================================================================
+
 with st.sidebar:
-    st.header("📂 Automação")
-    st.info("Faça upload da Nota Fiscal (XML ou PDF) para preencher os campos automaticamente.")
-    uploaded_file = st.file_uploader("Carregar Nota Fiscal", type=['xml', 'pdf'])
+    st.image("https://cdn-icons-png.flaticon.com/512/2910/2910768.png", width=60)
+    st.title("Configurações")
     
-    if uploaded_file is not None:
-        if st.button("🚀 Processar Arquivo"):
-            dados_extraidos = {}
-            if uploaded_file.type == "text/xml":
-                dados_extraidos = extrair_dados_xml(uploaded_file)
-            elif uploaded_file.type == "application/pdf":
-                dados_extraidos = extrair_dados_pdf(uploaded_file)
+    uploaded_logo = st.file_uploader("Logo para Relatórios (Opcional)", type=["png", "jpg", "jpeg"])
+    logo_bytes = uploaded_logo.read() if uploaded_logo else None
+
+    st.markdown("---")
+    uf_selecionada = st.selectbox("Selecione a UF", list(MUNICIPIOS_POR_UF.keys()))
+    
+    todos_municipios = MUNICIPIOS_POR_UF[uf_selecionada]
+    
+    col_sel1, col_sel2 = st.columns(2)
+    if col_sel1.button("Todos"):
+        st.session_state[f"mun_{uf_selecionada}"] = todos_municipios
+    if col_sel2.button("Limpar"):
+        st.session_state[f"mun_{uf_selecionada}"] = []
+        
+    municipios_selecionados = st.multiselect(
+        "Municípios", 
+        todos_municipios, 
+        key=f"mun_{uf_selecionada}"
+    )
+
+st.title("Hub de Relatório de Restrições 🏢")
+st.markdown("Faça upload dos PDFs da RFB/PGFN. O sistema identificará automaticamente a qual município pertencem, extrairá DEVEDOR/MAED/OMISSÃO e gerará os relatórios consolidados.")
+
+uploaded_files = st.file_uploader(
+    "Carregue os PDFs dos Relatórios de Situação Fiscal", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
+
+if st.button("🚀 Processar Arquivos", type="primary"):
+    if not uploaded_files:
+        st.warning("Por favor, faça upload de pelo menos um arquivo PDF.")
+        st.stop()
+    
+    if not municipios_selecionados:
+        st.warning("Selecione pelo menos um município na barra lateral.")
+        st.stop()
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Dicionário para guardar dados processados
+    # { "Nome Municipio": [ {item1}, {item2} ... ] }
+    dados_processados = {m: [] for m in municipios_selecionados}
+    fontes_encontradas = {m: None for m in municipios_selecionados}
+    
+    # Prepara normalização para match
+    mapa_norm = {m: normalizar(m) for m in municipios_selecionados}
+
+    # 1. Processamento e Triagem
+    total_files = len(uploaded_files)
+    arquivos_usados = 0
+    
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        
+        # A. Análise dos Arquivos
+        for idx, file in enumerate(uploaded_files):
+            status_text.text(f"Analisando: {file.name}...")
+            progress_bar.progress((idx + 1) / total_files)
             
-            if dados_extraidos:
-                if 'prestador' in dados_extraidos: st.session_state['form_prestador'] = dados_extraidos['prestador']
-                if 'cnpj' in dados_extraidos: st.session_state['form_cnpj'] = dados_extraidos['cnpj']
-                if 'numero' in dados_extraidos: st.session_state['form_numero'] = dados_extraidos['numero']
-                if 'valor' in dados_extraidos: st.session_state['form_valor'] = dados_extraidos['valor']
-                if 'inss' in dados_extraidos: st.session_state['form_retencao'] = dados_extraidos['inss']
-                st.success("Dados carregados com sucesso!")
-                st.rerun()
-            else:
-                st.warning("Não foi possível extrair dados automaticamente deste arquivo.")
+            nome_arquivo = normalizar(file.name)
+            file_bytes = file.getvalue()
+            
+            # Tenta casar arquivo com município selecionado
+            municipio_match = None
+            for m_real, m_norm in mapa_norm.items():
+                if corresponde_municipio(nome_arquivo, m_norm):
+                    municipio_match = m_real
+                    break
+            
+            if municipio_match:
+                arquivos_usados += 1
+                fontes_encontradas[municipio_match] = file.name
+                
+                # Extrai dados
+                itens = _extract_itens_from_stream(file_bytes, file.name)
+                dados_processados[municipio_match].extend(itens)
+                
+                # Salva o PDF original na pasta "Originais" dentro do ZIP
+                zip_file.writestr(f"Relatorios_Originais/{file.name}", file_bytes)
+        
+        # B. Geração dos Relatórios Individuais
+        status_text.text("Gerando relatórios individuais...")
+        for mun, itens in dados_processados.items():
+            if itens: # Só gera se tiver dados ou arquivo encontrado
+                pdf_bytes = gerar_pdf_individual(itens, mun, fontes_encontradas[mun], logo_bytes)
+                safe_name = mun.replace(" ", "_")
+                zip_file.writestr(f"Relatorios_Individuais/{safe_name}_Analise.pdf", pdf_bytes)
 
-# --- 6. FUNÇÕES UTILITÁRIAS ---
-def formatar_cnpj(cnpj):
-    if not cnpj: return ""
-    cnpj = re.sub(r'\D', '', str(cnpj))
-    if len(cnpj) == 14:
-        return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
-    return cnpj
+        # C. Geração dos Relatórios Gerenciais (Consolidados)
+        status_text.text("Gerando relatórios gerenciais...")
+        
+        pdf_maed = gerar_pdf_gerencial_maed(dados_processados, logo_bytes)
+        zip_file.writestr("Relatorios_Gerenciais/MAEDS_Consolidado.pdf", pdf_maed)
+        
+        pdf_devedor = gerar_pdf_gerencial_devedor(dados_processados, logo_bytes)
+        zip_file.writestr("Relatorios_Gerenciais/DEVEDORES_Consolidado.pdf", pdf_devedor)
+        
+        # D. Validade CND (Extra)
+        cnd_report = "RELATÓRIO DE VALIDADE CND\n\n"
+        for file in uploaded_files:
+             # Re-ler bytes
+             cnpj, val, nome = _extract_cnd_info_exact_stream(file.getvalue())
+             if val:
+                 cnd_report += f"Arquivo: {file.name}\nEntidade: {nome}\nCNPJ: {cnpj}\nValidade: {val}\n\n-----------------\n"
+        zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.txt", cnd_report)
 
-def gerar_pdf(dados):
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
+    progress_bar.progress(100)
+    status_text.text("Concluído!")
     
-    # Cores
-    cor_primaria = HexColor("#0E2F5A")    # Azul ConPrev
-    cor_secundaria = HexColor("#F0F2F6") 
-    cor_borda = HexColor("#D1D5DB")
+    st.success(f"Processamento finalizado! {arquivos_usados} arquivos foram identificados e processados.")
     
-    # Cabeçalho
-    c.setFillColor(cor_primaria)
-    c.rect(0, height - 100, width, 100, fill=True, stroke=False)
-    
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 22)
-    c.drawString(40, height - 50, "RELATÓRIO DE AUDITORIA")
-    c.setFont("Helvetica", 12)
-    c.drawString(40, height - 70, "Retenção de INSS - Lei 9.711/98")
-    
-    data_hora = datetime.now().strftime('%d/%m/%Y')
-    c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(width - 40, height - 50, f"DATA: {data_hora}")
-    
-    # Dados Prestador
-    y = height - 140
-    c.setFillColor(cor_secundaria)
-    c.roundRect(40, y - 70, width - 80, 80, 10, fill=True, stroke=False)
-    
-    c.setFillColor(cor_primaria)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y - 15, "1. DADOS DA NOTA FISCAL")
-    
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(50, y - 45, "PRESTADOR:")
-    c.drawString(350, y - 45, "CNPJ:")
-    c.setFont("Helvetica", 10)
-    c.drawString(130, y - 45, str(dados['prestador'])[:35])
-    c.drawString(400, y - 45, dados['cnpj'])
-    
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(50, y - 60, "NÚMERO NF:")
-    c.drawString(350, y - 60, "VALOR:")
-    c.setFont("Helvetica", 10)
-    c.drawString(130, y - 60, str(dados['num_nf']))
-    c.drawString(400, y - 60, f"R$ {dados['valor_servico']:,.2f}")
+    st.download_button(
+        label="📥 Baixar Pacote Completo (.zip)",
+        data=zip_buffer.getvalue(),
+        file_name=f"Analise_Restricoes_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        mime="application/zip",
+        type="primary"
+    )
 
-    # Análise
-    y -= 110
-    c.setFillColor(cor_primaria)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "2. ANÁLISE TRIBUTÁRIA")
-    y -= 30
-    c.setFont("Helvetica", 10)
-    c.setFillColor(colors.black)
-    c.drawString(40, y, f"Simples Nacional? {dados['is_simples'].upper()}  |  Anexo IV? {dados['is_anexo_iv'].upper()}")
-    
-    # Resultado Box
-    y -= 70
-    cor_res = HexColor("#E8F5E9") if dados['status'] == "OK" else HexColor("#FFEBEE")
-    c.setFillColor(cor_res)
-    c.roundRect(40, y - 80, width - 80, 90, 6, fill=True, stroke=False)
-    
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(55, y - 15, "3. APURAÇÃO E RESULTADO")
-    
-    c.setFont("Helvetica", 10)
-    c.drawString(55, y - 40, f"INSS Devido: R$ {dados['retencao_devida']:,.2f}")
-    c.drawString(55, y - 55, f"INSS na Nota: R$ {dados['retencao_destacada']:,.2f}")
-    
-    c.setFont("Helvetica-Bold", 12)
-    c.drawRightString(width - 60, y - 40, f"Diferença: R$ {dados['diferenca']:,.2f}")
-    
-    if dados['status'] == "OK":
-        c.setFillColor(HexColor("#2E7D32"))
-        msg = "✅ APROVADO"
-    else:
-        c.setFillColor(HexColor("#C62828"))
-        msg = "❌ DIVERGENTE"
-    c.drawRightString(width - 60, y - 60, msg)
-
-    # Rodapé
-    c.setStrokeColor(cor_borda)
-    c.line(40, 50, width - 40, 50)
-    c.setFont("Helvetica", 8)
-    c.setFillColor(colors.gray)
-    c.drawString(40, 35, "ConPrev Assessoria - Auditoria Fiscal Automatizada")
-    
-    c.save()
-    buffer.seek(0)
-    return buffer
-
-# --- 7. INTERFACE PRINCIPAL ---
-
-st.title("🛡️ Auditoria de Retenção de INSS")
-st.markdown("---")
-
-st.header("1. Dados da Nota Fiscal")
-col1, col2 = st.columns(2)
-
-with col1:
-    prestador = st.text_input("Nome do Prestador", key='form_prestador')
-    cnpj_input = st.text_input("CNPJ", key='form_cnpj', max_chars=18)
-    cnpj = formatar_cnpj(cnpj_input)
-    if cnpj_input and len(cnpj) < 18:
-        st.caption(f"Detectado: {cnpj}")
-
-with col2:
-    num_nf = st.text_input("Número da NF", key='form_numero')
-    valor_servico = st.number_input("Valor Total do Serviço (R$)", min_value=0.0, step=0.01, format="%.2f", key='form_valor')
-
-# --- FASE 2: TRIAGEM ---
-st.header("2. Triagem Tributária")
-col_t1, col_t2 = st.columns(2)
-with col_t1:
-    is_simples = st.radio("Simples Nacional?", ["Não", "Sim"], horizontal=True)
-with col_t2:
-    is_anexo_iv = "Não"
-    if is_simples == "Sim":
-        is_anexo_iv = st.radio("Atividade Anexo IV?", ["Não", "Sim"], horizontal=True)
-
-if is_simples == "Sim" and is_anexo_iv == "Não":
-    st.success("✅ **Sem Retenção.** Prestador Simples Nacional (Anexos I, II, III ou V).")
-else:
-    # --- FASE 3: CÁLCULOS ---
-    st.header("3. Conferência")
-    
-    col_c1, col_c2 = st.columns(2)
-    with col_c1:
-        percentual_base = st.slider("Base de Cálculo Legal (%)", 0, 100, 100)
-    with col_c2:
-        mao_obra_nfs = st.number_input("Mão de Obra na Nota (R$)", min_value=0.0, step=0.01, format="%.2f")
-
-    base_final = max(valor_servico * (percentual_base / 100), mao_obra_nfs)
-    retencao_devida = base_final * 0.11
-    
-    st.info(f"Base de Cálculo: **R$ {base_final:,.2f}** | Retenção Esperada (11%): **R$ {retencao_devida:,.2f}**")
-    
-    # Campo de Retenção Destacada
-    retencao_destacada = st.number_input("INSS Destacado na Nota (R$)", min_value=0.0, step=0.01, format="%.2f", key='form_retencao')
-    
-    diferenca = retencao_devida - retencao_destacada
-    
-    st.markdown("### Resultado")
-    status_audit = "OK"
-    orientacao = "Valores conferem. Arquivar."
-    
-    if abs(diferenca) < 0.05:
-        st.success(f"✅ **APROVADO!** Valor destacado: R$ {retencao_destacada:,.2f}")
-    else:
-        status_audit = "DIVERGENTE"
-        st.error(f"❌ **DIVERGÊNCIA DE R$ {diferenca:,.2f}**")
-        if retencao_destacada < retencao_devida:
-            orientacao = "Reter a diferença no pagamento ou pedir carta de correção."
-            st.warning("⚠️ O valor na nota é MENOR que o devido. O cliente corre risco fiscal.")
-        else:
-            orientacao = "Valor na nota é maior. Verificar base de cálculo."
-            st.warning("⚠️ O valor na nota é MAIOR que o devido.")
-
-    # --- BOTÃO PDF ---
-    if prestador:
-        dados_pdf = {
-            'prestador': prestador, 'cnpj': cnpj, 'num_nf': num_nf,
-            'valor_servico': valor_servico, 'is_simples': is_simples, 'is_anexo_iv': is_anexo_iv,
-            'percentual_base': percentual_base, 'base_final': base_final,
-            'retencao_devida': retencao_devida, 'retencao_destacada': retencao_destacada,
-            'diferenca': diferenca, 'status': status_audit, 'orientacao': orientacao
-        }
-        pdf = gerar_pdf(dados_pdf)
-        st.download_button("⬇️ Baixar Relatório PDF", pdf, f"Auditoria_{prestador}.pdf", "application/pdf")
+st.info("Nota: O sistema utiliza algoritmos de reconhecimento de texto para identificar 'DEVEDOR', 'MAED' e 'OMISSÃO'. Verifique sempre os arquivos originais em caso de dúvida.")
