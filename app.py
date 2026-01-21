@@ -469,7 +469,76 @@ def gerar_pdf_gerencial_devedor(dados_municipios, logo_bytes):
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
+def gerar_pdf_validade_cnd(lista_cnd, logo_bytes):
+    """Gera PDF com lista de CNDs e status colorido (Vencida/A Vencer)."""
+    doc = fitz.open()
+    fonts = _register_fonts(doc)
+    # A4 Retrato é melhor para listas simples
+    page = doc.new_page(width=595, height=842) 
+    titulo = "RELATÓRIO GERENCIAL · VALIDADE CND"
+    info = f"Gerado em {datetime.now().strftime('%d/%m/%Y')} · Fonte: RFB/PGFN"
+    
+    y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+    line_h = 14
+    gap = 24
+    
+    # Ordena: Vencidas primeiro, depois as mais próximas de vencer
+    # (dias ascending: negativos [vencidos] -> pequenos [urgentes] -> grandes [ok])
+    lista_cnd.sort(key=lambda k: (k['dias'] is None, k['dias']))
 
+    if not lista_cnd:
+        page.insert_text((x, y), "Nenhuma informação de validade encontrada.", fontname=fonts["regular"], fontsize=12)
+        out = io.BytesIO()
+        doc.save(out)
+        return out.getvalue()
+
+    for item in lista_cnd:
+        # Pula página se necessário
+        if y > 750:
+            page = doc.new_page(width=595, height=842)
+            y, x = _draw_header(page, logo_bytes, titulo, info, fonts)
+        
+        # Lógica de Cores
+        dias = item['dias']
+        color = (0,0,0) # Preto padrão
+        msg_dias = "Data inválida"
+
+        if dias is not None:
+            if dias < 0:
+                color = (0.8, 0.0, 0.0) # Vermelho (Vencida)
+                msg_dias = f"VENCIDA há {abs(dias)} dias"
+            elif dias == 0:
+                color = (0.8, 0.0, 0.0) # Vermelho (Vence hoje)
+                msg_dias = "VENCE HOJE"
+            elif dias <= 30:
+                color = (0.9, 0.5, 0.0) # Laranja (Urgente)
+                msg_dias = f"Vence em {dias} dias"
+            elif dias <= 90:
+                color = (0.8, 0.7, 0.0) # Amarelo (Atenção)
+                msg_dias = f"Vence em {dias} dias"
+            else:
+                color = (0.0, 0.5, 0.0) # Verde (OK)
+                msg_dias = f"Vence em {dias} dias"
+
+        # Linha 1: Nome e CNPJ
+        nome_display = item['nome'] or "Não identificado"
+        cnpj_display = f"(CNPJ: {item['cnpj']})" if item['cnpj'] else ""
+        page.insert_text((x, y), f"• {nome_display} {cnpj_display}", fontname=fonts["bold"], fontsize=10)
+        y += line_h
+        
+        # Linha 2: Validade e Status Colorido
+        lbl_val = f"  Validade: {item['validade']}  |  Situação: "
+        page.insert_text((x, y), lbl_val, fontname=fonts["regular"], fontsize=10)
+        
+        # Calcula onde desenhar o texto colorido logo após o rótulo
+        len_lbl = fitz.get_text_length(lbl_val, fontname=fonts["regular"], fontsize=10)
+        page.insert_text((x + len_lbl, y), msg_dias, fontname=fonts["bold"], fontsize=10, color=color)
+        
+        y += gap
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
 # ==============================================================================
 # 5. INTERFACE STREAMLIT
 # ==============================================================================
@@ -601,3 +670,4 @@ if st.button("🚀 Processar Arquivos", type="primary"):
     )
 
 st.info("Nota: O sistema utiliza algoritmos de reconhecimento de texto para identificar 'DEVEDOR', 'MAED' e 'OMISSÃO'. Verifique sempre os arquivos originais em caso de dúvida.")
+
