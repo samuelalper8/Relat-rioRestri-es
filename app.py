@@ -576,6 +576,8 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+# ... (todo o código anterior permanece igual) ...
+
 if st.button("🚀 Processar Arquivos", type="primary"):
     if not uploaded_files:
         st.warning("Por favor, faça upload de pelo menos um arquivo PDF.")
@@ -588,15 +590,13 @@ if st.button("🚀 Processar Arquivos", type="primary"):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Dicionário para guardar dados processados
-    # { "Nome Municipio": [ {item1}, {item2} ... ] }
     dados_processados = {m: [] for m in municipios_selecionados}
     fontes_encontradas = {m: None for m in municipios_selecionados}
     
-    # Prepara normalização para match
-    mapa_norm = {m: normalizar(m) for m in municipios_selecionados}
+    # --- NOVA LISTA PARA O RELATÓRIO DE CND ---
+    lista_cnd_global = [] 
 
-    # 1. Processamento e Triagem
+    mapa_norm = {m: normalizar(m) for m in municipios_selecionados}
     total_files = len(uploaded_files)
     arquivos_usados = 0
     
@@ -605,14 +605,30 @@ if st.button("🚀 Processar Arquivos", type="primary"):
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         
         # A. Análise dos Arquivos
+        hoje = date.today() # Data de hoje para cálculo
+        
         for idx, file in enumerate(uploaded_files):
             status_text.text(f"Analisando: {file.name}...")
             progress_bar.progress((idx + 1) / total_files)
             
-            nome_arquivo = normalizar(file.name)
             file_bytes = file.getvalue()
             
-            # Tenta casar arquivo com município selecionado
+            # --- 1. Extração de CND (Para o relatório de validade) ---
+            cnpj_cnd, val_cnd, nome_cnd = _extract_cnd_info_exact_stream(file_bytes)
+            if val_cnd:
+                data_obj = _parse_date_br_to_date(val_cnd)
+                dias_restantes = (data_obj - hoje).days if data_obj else None
+                
+                lista_cnd_global.append({
+                    "arquivo": file.name,
+                    "nome": nome_cnd,
+                    "cnpj": cnpj_cnd,
+                    "validade": val_cnd,
+                    "dias": dias_restantes
+                })
+
+            # --- 2. Identificação do Município (Para os relatórios de restrição) ---
+            nome_arquivo = normalizar(file.name)
             municipio_match = None
             for m_real, m_norm in mapa_norm.items():
                 if corresponde_municipio(nome_arquivo, m_norm):
@@ -623,17 +639,15 @@ if st.button("🚀 Processar Arquivos", type="primary"):
                 arquivos_usados += 1
                 fontes_encontradas[municipio_match] = file.name
                 
-                # Extrai dados
                 itens = _extract_itens_from_stream(file_bytes, file.name)
                 dados_processados[municipio_match].extend(itens)
                 
-                # Salva o PDF original na pasta "Originais" dentro do ZIP
                 zip_file.writestr(f"Relatorios_Originais/{file.name}", file_bytes)
         
         # B. Geração dos Relatórios Individuais
         status_text.text("Gerando relatórios individuais...")
         for mun, itens in dados_processados.items():
-            if itens: # Só gera se tiver dados ou arquivo encontrado
+            if itens: 
                 pdf_bytes = gerar_pdf_individual(itens, mun, fontes_encontradas[mun], logo_bytes)
                 safe_name = mun.replace(" ", "_")
                 zip_file.writestr(f"Relatorios_Individuais/{safe_name}_Analise.pdf", pdf_bytes)
@@ -647,19 +661,22 @@ if st.button("🚀 Processar Arquivos", type="primary"):
         pdf_devedor = gerar_pdf_gerencial_devedor(dados_processados, logo_bytes)
         zip_file.writestr("Relatorios_Gerenciais/DEVEDORES_Consolidado.pdf", pdf_devedor)
         
-        # D. Validade CND (Extra)
-        cnd_report = "RELATÓRIO DE VALIDADE CND\n\n"
-        for file in uploaded_files:
-             # Re-ler bytes
-             cnpj, val, nome = _extract_cnd_info_exact_stream(file.getvalue())
-             if val:
-                 cnd_report += f"Arquivo: {file.name}\nEntidade: {nome}\nCNPJ: {cnpj}\nValidade: {val}\n\n-----------------\n"
-        zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.txt", cnd_report)
+        # D. Validade CND (PDF Colorido) - AQUI ESTAVA O ERRO ANTES
+        status_text.text("Gerando relatório de Validade CND...")
+        
+        # Agora chamamos a função correta que gera PDF, não o TXT
+        if lista_cnd_global:
+            pdf_cnd = gerar_pdf_validade_cnd(lista_cnd_global, logo_bytes)
+            zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.pdf", pdf_cnd)
+        else:
+            # PDF vazio avisando que não achou nada
+            pdf_cnd = gerar_pdf_validade_cnd([], logo_bytes)
+            zip_file.writestr("Relatorios_Gerenciais/Validade_CNDs.pdf", pdf_cnd)
 
     progress_bar.progress(100)
     status_text.text("Concluído!")
     
-    st.success(f"Processamento finalizado! {arquivos_usados} arquivos foram identificados e processados.")
+    st.success(f"Processamento finalizado! {arquivos_usados} arquivos identificados como municípios cadastrados.")
     
     st.download_button(
         label="📥 Baixar Pacote Completo (.zip)",
@@ -670,4 +687,3 @@ if st.button("🚀 Processar Arquivos", type="primary"):
     )
 
 st.info("Nota: O sistema utiliza algoritmos de reconhecimento de texto para identificar 'DEVEDOR', 'MAED' e 'OMISSÃO'. Verifique sempre os arquivos originais em caso de dúvida.")
-
